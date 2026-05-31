@@ -70,7 +70,7 @@ function App() {
 
       {/* Pages */}
       <main className="app-main">
-        {activeTab === 'home'     && <HomePage onScan={() => setActiveTab('analysis')} />}
+        {activeTab === 'home'     && <HomePage onScan={() => setActiveTab('analysis')} onAddMeal={() => setActiveTab('history')} />}
         {activeTab === 'history'  && <HistoryPage />}
         {activeTab === 'stats'    && <StatsPage />}
         {activeTab === 'goals'    && <GoalsPage />}

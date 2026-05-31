@@ -61,7 +61,7 @@ function MacroBar({ label, value, target, color }) {
   );
 }
 
-export default function HomePage({ onScan }) {
+export default function HomePage({ onScan, onAddMeal }) {
   const { state, addWater } = useStore();
   const fileRef = useRef(null);
 
@@ -197,7 +197,7 @@ export default function HomePage({ onScan }) {
                       </p>
                     </div>
                   </div>
-                  <button onClick={onScan} style={{
+                  <button onClick={onAddMeal} style={{
                     width: 32, height: 32, borderRadius: '50%',
                     background: 'var(--grad)', border: 'none',
                     display: 'flex', alignItems: 'center', justifyContent: 'center',
