@@ -4,12 +4,9 @@ import {
   ArrowLeft, Check, RefreshCw, Edit2, Clock, Zap, Scale,
   Camera, Image, Sparkles, ChevronDown, ChevronUp, Info, AlertTriangle
 } from 'lucide-react';
-import * as tf from '@tensorflow/tfjs';
-import * as mobilenet from '@tensorflow-models/mobilenet';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import { useStore } from '../context/StoreContext';
 import { mealsDB } from '../data/meals';
-
-const FOOD_KEYWORDS = ['food', 'meal', 'dish', 'plate', 'bowl', 'pizza', 'burger', 'hotdog', 'apple', 'orange', 'banana', 'strawberry', 'cake', 'bread', 'cheese', 'salad', 'soup', 'sandwich', 'ice cream', 'chocolate', 'cookie', 'coffee', 'tea', 'drink', 'beverage', 'noodle', 'pasta', 'rice', 'egg', 'fish', 'chicken', 'beef', 'pork', 'bakery', 'dough', 'pie', 'pudding', 'sauce', 'snack', 'candy', 'nut', 'seed', 'spaghetti', 'macaroni', 'bagel', 'pretzel', 'potato', 'pepper', 'cauliflower', 'broccoli', 'zucchini', 'cucumber', 'mushroom', 'lemon', 'fig', 'pineapple', 'jackfruit', 'pomegranate', 'squash', 'artichoke', 'guacamole', 'consomme', 'hot pot', 'trifle', 'lolly', 'espresso', 'wine', 'meat', 'corn', 'cabbage', 'carbonara', 'burrito', 'cup', 'mug', 'loaf', 'grocery', 'restaurant', 'dining', 'menu', 'granny smith', 'vegetable', 'fruit', 'fry', 'steak', 'chow', 'wrap', 'toast', 'waffle', 'pancake', 'muffin', 'croissant'];
 
 const MEAL_TYPES = [
   { id: 'breakfast', label: '🌅 Breakfast' },
@@ -521,12 +518,12 @@ export default function AnalysisPage({ onBack }) {
   const [scanTime, setScanTime] = useState('');
   const [saved, setSaved]     = useState(false);
 
-  const startScan = useCallback(async (url = '') => {
+  const startScan = useCallback(async (url = '', file = null) => {
     setImageUrl(url);
     setPhase('scanning');
 
-    if (!url) {
-      // Demo mode bypasses TFJS
+    if (!url || !file) {
+      // Demo mode bypasses
       setTimeout(() => {
         const pick = mealsDB[Math.floor(Math.random() * mealsDB.length)];
         setMeal(pick);
@@ -537,51 +534,67 @@ export default function AnalysisPage({ onBack }) {
     }
 
     try {
-      // 1. Create image element to read data
-      const img = document.createElement('img');
-      img.src = url;
-      await new Promise((resolve, reject) => {
-        img.onload = resolve;
-        img.onerror = reject;
+      // Convert file to base64
+      const reader = new FileReader();
+      const base64Promise = new Promise((resolve, reject) => {
+        reader.onload = () => resolve(reader.result.split(',')[1]);
+        reader.onerror = reject;
       });
+      reader.readAsDataURL(file);
+      const base64Data = await base64Promise;
 
-      // 2. Load MobileNet & Classify
-      await tf.ready();
-      const model = await mobilenet.load({ version: 2, alpha: 0.5 });
-      const predictions = await model.classify(img);
+      const genAI = new GoogleGenerativeAI(import.meta.env.VITE_GEMINI_API_KEY);
+      const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+
+      const prompt = `Analyze this image. If it is NOT food, return exactly: {"error": "not_food"}. If it is food, provide the nutrition data in the exact JSON format below. Only return JSON, no markdown.
+{
+  "name": "Exact Name of Food in Image",
+  "calories": 100, "protein": 10, "carbs": 10, "fat": 10,
+  "fiber": 5, "sugar": 5, "sodium": 100, "cholesterol": 10,
+  "grade": "A", "healthy": 85, "confidence": 95, "type": "global",
+  "ingredients": ["ingredient 1", "ingredient 2"],
+  "vitamins": { "vitaminA": 10, "vitaminC": 10, "vitaminD": 10, "vitaminB12": 10, "iron": 10, "calcium": 10, "potassium": 10 },
+  "coach": "A brief actionable advice"
+}`;
+
+      const imageParts = [
+        {
+          inlineData: {
+            data: base64Data,
+            mimeType: file.type
+          }
+        }
+      ];
+
+      const result = await model.generateContent([prompt, ...imageParts]);
+      const response = await result.response;
+      let text = response.text();
+      text = text.replace(/```json/g, '').replace(/```/g, '').trim();
       
-      console.log("AI Predictions:", predictions);
+      const parsedData = JSON.parse(text);
 
-      // 3. Check if any prediction matches our food keywords
-      const isFood = predictions.some(p => {
-        const name = p.className.toLowerCase();
-        return FOOD_KEYWORDS.some(kw => name.includes(kw));
-      });
-
-      if (!isFood) {
+      if (parsedData.error === "not_food") {
         setPhase('error');
         return;
       }
-      
-      // 4. Proceed to Result
-      const pick = mealsDB[Math.floor(Math.random() * mealsDB.length)];
-      setMeal(pick);
+
+      setMeal(parsedData);
       setScanTime(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
       setPhase('result');
 
     } catch(err) {
       console.error("AI classification error:", err);
-      // Fallback on error (could just show error screen too)
+      // Fallback on error
       setPhase('error');
     }
   }, []);
 
   const handleFile = (file) => {
     const url = URL.createObjectURL(file);
-    startScan(url);
+    startScan(url, file);
   };
 
-  const handleDemo = () => startScan('');
+  const handleDemo = () => startScan('', null);
 
   const handleRescan = () => {
     setSaved(false);
