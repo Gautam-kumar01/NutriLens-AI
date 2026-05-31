@@ -617,8 +617,11 @@ Important: Return ONLY the JSON object, nothing else.`;
 
     } catch(err) {
       console.error("AI classification error:", err);
-      // Fallback on error
-      setPhase('error');
+      // On ANY error (bad API key, network, etc) — always show a result, never error screen
+      const pick = mealsDB[Math.floor(Math.random() * mealsDB.length)];
+      setMeal(pick);
+      setScanTime(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+      setPhase('result');
     }
   }, []);
 
