@@ -4,7 +4,7 @@ import {
   ArrowLeft, Check, RefreshCw, Edit2, Clock, Zap, Scale,
   Camera, Image, Sparkles, ChevronDown, ChevronUp, Info, AlertTriangle
 } from 'lucide-react';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import OpenAI from 'openai';
 import { useStore } from '../context/StoreContext';
 import { mealsDB } from '../data/meals';
 
@@ -543,14 +543,17 @@ export default function AnalysisPage({ onBack }) {
       reader.readAsDataURL(file);
       const base64Data = await base64Promise;
 
-      const genAI = new GoogleGenerativeAI(import.meta.env.VITE_GEMINI_API_KEY);
-      const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+      const openai = new OpenAI({
+        apiKey: import.meta.env.VITE_OPENAI_API_KEY,
+        baseURL: 'https://api.groq.com/openai/v1',
+        dangerouslyAllowBrowser: true,
+      });
 
-      const prompt = `You are a nutrition expert AI. Look at this food image carefully and identify what food/meal is shown.
-If this image does NOT contain any food at all, return ONLY this exact JSON: {"error": "not_food"}
-If it DOES contain food (any food, meal, snack, drink), return nutrition data in this exact JSON format with no extra text:
+      const prompt = `You are a professional nutritionist AI. Carefully analyze this food image.
+If the image does NOT contain any food, return ONLY: {"error": "not_food"}
+If it contains food, return ONLY a JSON object (no markdown, no extra text) in this exact format:
 {
-  "name": "Exact specific name of the food/dish shown",
+  "name": "Exact name of the dish/meal shown in the image",
   "calories": 450,
   "protein": 20,
   "carbs": 55,
@@ -563,34 +566,41 @@ If it DOES contain food (any food, meal, snack, drink), return nutrition data in
   "healthy": 78,
   "confidence": 92,
   "type": "indian",
-  "ingredients": ["main ingredient 1", "ingredient 2", "ingredient 3"],
+  "ingredients": ["ingredient1", "ingredient2", "ingredient3"],
   "vitamins": { "vitaminA": 15, "vitaminC": 20, "vitaminD": 5, "vitaminB12": 8, "iron": 25, "calcium": 10, "potassium": 18 },
-  "coach": "One sentence of specific nutrition advice for this meal."
+  "coach": "One specific actionable nutrition tip for this meal."
 }
-Important: Return ONLY the JSON object, nothing else.`;
+Base all nutrition values on a standard single serving. For Indian meals, be specific (e.g. 'Dal Tadka with Steamed Rice', not just 'Indian Food').`;
 
-      const imageParts = [
-        {
-          inlineData: {
-            data: base64Data,
-            mimeType: file.type
-          }
-        }
-      ];
+      const response = await openai.chat.completions.create({
+        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        max_tokens: 800,
+        temperature: 0.1,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: prompt },
+              {
+                type: 'image_url',
+                image_url: {
+                  url: `data:${file.type};base64,${base64Data}`,
+                  detail: 'high',
+                },
+              },
+            ],
+          },
+        ],
+      });
 
-      const result = await model.generateContent([prompt, ...imageParts]);
-      const response = await result.response;
-      let text = response.text();
-      console.log("Gemini raw response:", text);
+      let text = response.choices[0].message.content || '';
+      console.log('OpenAI raw response:', text);
 
-      // Robust JSON extraction — grab first complete {...} block
+      // Extract JSON block robustly
       const jsonMatch = text.match(/\{[\s\S]*\}/);
       if (!jsonMatch) {
-        console.warn("No JSON found in response, using smart fallback");
-        const pick = mealsDB[Math.floor(Math.random() * mealsDB.length)];
-        setMeal(pick);
-        setScanTime(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
-        setPhase('result');
+        console.warn('No JSON in response, showing error screen');
+        setPhase('error');
         return;
       }
 
@@ -598,15 +608,12 @@ Important: Return ONLY the JSON object, nothing else.`;
       try {
         parsedData = JSON.parse(jsonMatch[0]);
       } catch (parseErr) {
-        console.warn("JSON parse failed, using smart fallback:", parseErr);
-        const pick = mealsDB[Math.floor(Math.random() * mealsDB.length)];
-        setMeal(pick);
-        setScanTime(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
-        setPhase('result');
+        console.warn('JSON parse failed, showing error screen:', parseErr);
+        setPhase('error');
         return;
       }
 
-      if (parsedData.error === "not_food") {
+      if (parsedData.error === 'not_food') {
         setPhase('error');
         return;
       }
@@ -615,13 +622,10 @@ Important: Return ONLY the JSON object, nothing else.`;
       setScanTime(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
       setPhase('result');
 
-    } catch(err) {
-      console.error("AI classification error:", err);
-      // On ANY error (bad API key, network, etc) — always show a result, never error screen
-      const pick = mealsDB[Math.floor(Math.random() * mealsDB.length)];
-      setMeal(pick);
-      setScanTime(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
-      setPhase('result');
+    } catch (err) {
+      console.error('OpenAI error:', err);
+      // API error (like missing key, rate limit, etc.) → show error screen
+      setPhase('error');
     }
   }, []);
 
