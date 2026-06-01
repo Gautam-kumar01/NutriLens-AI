@@ -577,88 +577,107 @@ export default function AnalysisPage({ onBack }) {
         dangerouslyAllowBrowser: true,
       });
 
-      prompt = `You are a professional nutritionist AI. Carefully analyze this food image.
-If the image does NOT contain any food, return ONLY: {"error": "not_food"}
-If it contains food, return ONLY a JSON object (no markdown, no extra text) in this exact format:
+      // ── Positive-first prompt: model should ALWAYS try to identify food ──
+      prompt = `You are an expert food recognition and nutrition AI. This image contains food — analyze it and return nutrition data.
+Return ONLY a valid JSON object (no markdown, no code fences, no extra text) in exactly this format:
 {
-  "name": "Exact name of the dish/meal shown in the image",
-  "calories": 450,
-  "protein": 20,
-  "carbs": 55,
-  "fat": 15,
-  "fiber": 8,
-  "sugar": 6,
-  "sodium": 520,
-  "cholesterol": 30,
+  "name": "Specific dish name (e.g. 'South Indian Thali', 'Butter Chicken with Rice', 'Margherita Pizza')",
+  "calories": 520,
+  "protein": 22,
+  "carbs": 60,
+  "fat": 18,
+  "fiber": 6,
+  "sugar": 8,
+  "sodium": 480,
+  "cholesterol": 35,
   "grade": "B+",
-  "healthy": 78,
-  "confidence": 92,
+  "healthy": 72,
+  "confidence": 88,
   "type": "indian",
-  "ingredients": ["ingredient1", "ingredient2", "ingredient3"],
-  "vitamins": { "vitaminA": 15, "vitaminC": 20, "vitaminD": 5, "vitaminB12": 8, "iron": 25, "calcium": 10, "potassium": 18 },
-  "coach": "One specific actionable nutrition tip for this meal."
+  "ingredients": ["rice", "dal", "sabzi", "roti"],
+  "vitamins": {"vitaminA": 12, "vitaminC": 18, "vitaminD": 4, "vitaminB12": 6, "iron": 20, "calcium": 15, "potassium": 22},
+  "coach": "One practical tip to make this meal healthier."
 }
-Base all nutrition values on a standard single serving. For Indian meals, be specific (e.g. 'Dal Tadka with Steamed Rice', not just 'Indian Food').`;
+Rules:
+- Be SPECIFIC with food name — never say 'Unknown' or 'Food'
+- For Indian meals name them precisely: 'Dal Tadka', 'Rajma Chawal', 'Idli Sambar', etc.
+- If you cannot identify the exact dish, make your best guess from visual cues
+- Only if the image is CLEARLY not food at all (e.g. a car, a landscape, a person), set "name" to "not_food"
+- Estimate nutrition for a standard serving size
+- "confidence" should reflect how certain you are (50-99)
+- "grade" should be A/A+/B/B+/C/C+ based on nutritional quality`;
 
-      // 45-second abort controller so scanning never gets stuck forever
+      // ── API call with 45-second timeout ──
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 45000);
+      const timeoutId  = setTimeout(() => controller.abort(), 45000);
 
       let response;
       try {
         response = await openai.chat.completions.create({
           model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-          max_tokens: 600,
-          temperature: 0.1,
-          messages: [
-            {
-              role: 'user',
-              content: [
-                { type: 'text', text: prompt },
-                {
-                  type: 'image_url',
-                  image_url: {
-                    url: `data:${file.type};base64,${base64Data}`,
-                    detail: 'auto',
-                  },
-                },
-              ],
-            },
-          ],
+          max_tokens: 700,
+          temperature: 0.2,
+          messages: [{
+            role: 'user',
+            content: [
+              { type: 'text', text: prompt },
+              { type: 'image_url', image_url: { url: `data:${file.type};base64,${base64Data}`, detail: 'high' } },
+            ],
+          }],
         }, { signal: controller.signal });
       } finally {
         clearTimeout(timeoutId);
       }
 
       const durationMs = Math.round(performance.now() - startTime);
-      let text = response.choices[0].message.content || '';
+      let text = (response.choices[0].message.content || '').trim();
       console.log('Groq raw response:', text);
 
-      // ── Robust JSON extraction ── strip markdown fences if present
-      text = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
-      const jsonMatch = text.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        console.warn('No JSON in response');
-        addAiLog({ status: 'error', error: 'No JSON found in AI response', rawText: text, prompt, durationMs, thumbnail: thumbnailData });
+      // Strip markdown fences if model wrapped output
+      text = text.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+
+      // Extract outermost JSON object
+      const jsonStart = text.indexOf('{');
+      const jsonEnd   = text.lastIndexOf('}');
+      if (jsonStart === -1 || jsonEnd === -1) {
+        console.warn('No JSON found in response');
+        addAiLog({ status: 'error', error: 'AI returned no JSON. Raw: ' + text.slice(0, 200), rawText: text, prompt, durationMs, thumbnail: thumbnailData });
         setPhase('error');
         return;
       }
 
       let parsedData;
       try {
-        parsedData = JSON.parse(jsonMatch[0]);
+        parsedData = JSON.parse(text.slice(jsonStart, jsonEnd + 1));
       } catch (parseErr) {
         console.warn('JSON parse failed:', parseErr);
-        addAiLog({ status: 'error', error: 'JSON parse failed: ' + parseErr.message, rawText: text, prompt, durationMs, thumbnail: thumbnailData });
+        addAiLog({ status: 'error', error: 'JSON parse error: ' + parseErr.message, rawText: text, prompt, durationMs, thumbnail: thumbnailData });
         setPhase('error');
         return;
       }
 
-      if (parsedData.error === 'not_food') {
-        addAiLog({ status: 'error', error: 'No food detected in image', rawText: text, parsedData, prompt, durationMs, thumbnail: thumbnailData });
+      // If model flagged not_food via the name field
+      if (parsedData.name === 'not_food' || parsedData.error === 'not_food') {
+        addAiLog({ status: 'error', error: 'Image does not appear to contain food', rawText: text, parsedData, prompt, durationMs, thumbnail: thumbnailData });
         setPhase('error');
         return;
       }
+
+      // Ensure required fields have sensible defaults so Result screen never crashes
+      parsedData.name        = parsedData.name        || 'Detected Meal';
+      parsedData.calories    = parsedData.calories    || 0;
+      parsedData.protein     = parsedData.protein     || 0;
+      parsedData.carbs       = parsedData.carbs       || 0;
+      parsedData.fat         = parsedData.fat         || 0;
+      parsedData.fiber       = parsedData.fiber       || 0;
+      parsedData.sugar       = parsedData.sugar       || 0;
+      parsedData.sodium      = parsedData.sodium      || 0;
+      parsedData.cholesterol = parsedData.cholesterol || 0;
+      parsedData.grade       = parsedData.grade       || 'B';
+      parsedData.confidence  = parsedData.confidence  || 75;
+      parsedData.ingredients = parsedData.ingredients || [];
+      parsedData.vitamins    = parsedData.vitamins    || {};
+      parsedData.coach       = parsedData.coach       || 'Eat mindfully and enjoy your meal!';
 
       addAiLog({
         status: 'success',
