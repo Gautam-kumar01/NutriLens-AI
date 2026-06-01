@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback } from 'react';
+import React, { useState, useRef, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   ArrowLeft, Check, RefreshCw, Edit2, Clock, Zap, Scale,
@@ -40,6 +40,92 @@ function NutrientRow({ label, pct, color }) {
     </div>
   );
 }
+
+const FOOD_SCAN_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
+const DEFAULT_VITAMINS = { vitaminA: 0, vitaminC: 0, vitaminD: 0, vitaminB12: 0, iron: 0, calcium: 0, potassium: 0 };
+const NUMBER_FIELDS = ['calories', 'protein', 'carbs', 'fat', 'fiber', 'sugar', 'sodium', 'cholesterol', 'healthy', 'confidence'];
+const ALLOWED_GRADES = new Set(['A+', 'A', 'A-', 'B+', 'B', 'B-', 'C+', 'C']);
+
+const clampNumber = (value, fallback, min = 0, max = Number.POSITIVE_INFINITY) => {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.max(min, Math.min(max, Math.round(number)));
+};
+
+const isNotFoodResult = (data) => {
+  const marker = String(data?.name || data?.error || '').trim().toLowerCase();
+  return marker === 'not_food' || marker === 'not food' || marker === 'no_food';
+};
+
+const extractJsonObject = (rawText) => {
+  const text = String(rawText || '')
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/```\s*$/i, '')
+    .trim();
+  const jsonStart = text.indexOf('{');
+  const jsonEnd = text.lastIndexOf('}');
+  if (jsonStart === -1 || jsonEnd === -1 || jsonEnd <= jsonStart) return null;
+  return JSON.parse(text.slice(jsonStart, jsonEnd + 1));
+};
+
+const normalizeMealData = (data) => {
+  const normalized = { ...data };
+
+  NUMBER_FIELDS.forEach(field => {
+    normalized[field] = clampNumber(
+      normalized[field],
+      field === 'confidence' ? 72 : 0,
+      0,
+      field === 'confidence' || field === 'healthy' ? 99 : Number.POSITIVE_INFINITY
+    );
+  });
+
+  normalized.name = String(normalized.name || '').trim() || 'Detected Meal';
+  normalized.grade = ALLOWED_GRADES.has(normalized.grade) ? normalized.grade : 'B';
+  normalized.type = normalized.type === 'indian' ? 'indian' : 'global';
+  normalized.ingredients = Array.isArray(normalized.ingredients)
+    ? normalized.ingredients.map(item => String(item).trim()).filter(Boolean).slice(0, 8)
+    : [];
+  normalized.vitamins = { ...DEFAULT_VITAMINS, ...(normalized.vitamins || {}) };
+  Object.keys(DEFAULT_VITAMINS).forEach(key => {
+    normalized.vitamins[key] = clampNumber(normalized.vitamins[key], 0, 0, 100);
+  });
+  normalized.coach = String(normalized.coach || '').trim() || 'Eat mindfully and enjoy your meal.';
+
+  return normalized;
+};
+
+const getFoodPrompt = (retry = false) => `You are an expert food recognition and nutrition AI. Analyze this image for visible food and return nutrition data.
+Return ONLY a valid JSON object (no markdown, no code fences, no extra text) in exactly this format:
+{
+  "name": "Specific dish name (e.g. 'South Indian Thali', 'Butter Chicken with Rice', 'Margherita Pizza')",
+  "calories": 520,
+  "protein": 22,
+  "carbs": 60,
+  "fat": 18,
+  "fiber": 6,
+  "sugar": 8,
+  "sodium": 480,
+  "cholesterol": 35,
+  "grade": "B+",
+  "healthy": 72,
+  "confidence": 88,
+  "type": "indian",
+  "ingredients": ["rice", "dal", "sabzi", "roti"],
+  "vitamins": {"vitaminA": 12, "vitaminC": 18, "vitaminD": 4, "vitaminB12": 6, "iron": 20, "calcium": 15, "potassium": 22},
+  "coach": "One practical tip to make this meal healthier."
+}
+Rules:
+- If the image contains any edible item, plate, bowl, cooked dish, snack, drink, fruit, or restaurant meal, make your best nutrition estimate.
+- Do not reject real meals because they are mixed, partly cropped, homemade, dimly lit, or hard to identify exactly.
+- Be specific with food name. If exact dish is uncertain, name the closest likely dish instead of using "Unknown" or "Food".
+- For Indian meals name them precisely: "Dal Tadka", "Rajma Chawal", "Idli Sambar", "Veg Thali", etc.
+- Set "name" to "not_food" only when the image clearly has no edible item at all, such as a car, document, landscape, room, or person-only photo.
+- Estimate nutrition for one standard visible serving size.
+- "confidence" should reflect certainty (50-99).
+- "grade" should be A/A+/B/B+/C/C+ based on nutritional quality.
+${retry ? '- This is a second pass after a possible false rejection. Look carefully for real food before returning "not_food".' : ''}`;
 
 // ─── Upload / Picker screen ────────────────────────────────────────
 function PickerScreen({ onFile, onDemo, onBack }) {
@@ -183,7 +269,7 @@ function ScanningScreen({ imageUrl }) {
   React.useEffect(() => {
     const interval = setInterval(() => setCurrentStep(s => Math.min(s + 1, STEPS.length - 1)), 420);
     return () => clearInterval(interval);
-  }, []);
+  }, [STEPS.length]);
 
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} style={{ minHeight: '75vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 28, padding: 20 }}>
@@ -253,10 +339,13 @@ function ResultScreen({ meal, imageUrl, scanTime, onBack, onRescan, onSave, save
   const [showVitamins, setShowVitamins] = useState(false);
   const [showIngredients, setShowIngredients] = useState(true);
 
-  const confidenceIngredients = meal.ingredients.map((ing, i) => ({
-    name: ing,
-    confidence: Math.min(meal.confidence - i * 2 + Math.floor(Math.random() * 3), 99),
-  }));
+  const confidenceIngredients = useMemo(() => meal.ingredients.map((ing, i) => {
+    const jitter = ing.split('').reduce((sum, char) => sum + char.charCodeAt(0), 0) % 3;
+    return {
+      name: ing,
+      confidence: Math.max(50, Math.min(meal.confidence - i * 2 + jitter, 99)),
+    };
+  }), [meal.confidence, meal.ingredients]);
 
   const vitamins = meal.vitamins ?? {};
 
@@ -489,16 +578,19 @@ function ResultScreen({ meal, imageUrl, scanTime, onBack, onRescan, onSave, save
 }
 
 // ─── Error screen (Not Food) ───────────────────────────────────────
-function ErrorScreen({ onRetry, onBack }) {
+function ErrorScreen({ onRetry, onBack, kind = 'not_food', message = '' }) {
+  const isNotFood = kind === 'not_food';
   return (
     <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} style={{ minHeight: '75vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 20, padding: 20, textAlign: 'center' }}>
       <div style={{ width: 80, height: 80, borderRadius: '50%', background: 'rgba(239,68,68,0.1)', color: '#ef4444', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '2.5rem' }}>
         <AlertTriangle size={40} />
       </div>
       <div>
-        <h2 style={{ fontSize: '1.4rem', marginBottom: 8 }}>No Food Detected</h2>
+        <h2 style={{ fontSize: '1.4rem', marginBottom: 8 }}>{isNotFood ? 'No Food Detected' : 'Scan Failed'}</h2>
         <p className="muted" style={{ fontSize: '0.9rem', lineHeight: 1.5 }}>
-          Our AI couldn't detect any meals in this image. Please make sure the photo clearly shows food.
+          {isNotFood
+            ? "Our AI couldn't detect any meals in this image. Please make sure the photo clearly shows food."
+            : (message || "The AI scanner couldn't finish this photo. Please try again in a moment.")}
         </p>
       </div>
       <div style={{ display: 'flex', gap: 12, marginTop: 12 }}>
@@ -517,9 +609,13 @@ export default function AnalysisPage({ onBack }) {
   const [meal, setMeal]       = useState(null);
   const [scanTime, setScanTime] = useState('');
   const [saved, setSaved]     = useState(false);
+  const [errorInfo, setErrorInfo] = useState({ kind: 'not_food', message: '' });
 
   const startScan = useCallback(async (url = '', file = null) => {
     setImageUrl(url);
+    setMeal(null);
+    setSaved(false);
+    setErrorInfo({ kind: 'not_food', message: '' });
     setPhase('scanning');
 
     if (!url || !file) {
@@ -547,10 +643,11 @@ export default function AnalysisPage({ onBack }) {
       });
       reader.readAsDataURL(file);
       const base64Data = await base64Promise;
+      const mimeType = file.type || 'image/jpeg';
 
       // Create compressed thumbnail (max 400px, 70% quality) for logs
       thumbnailData = await new Promise((resolve) => {
-        const img = new Image();
+        const img = new window.Image();
         img.onload = () => {
           const canvas = document.createElement('canvas');
           const ctx = canvas.getContext('2d');
@@ -568,8 +665,12 @@ export default function AnalysisPage({ onBack }) {
           resolve(canvas.toDataURL('image/jpeg', 0.7));
         };
         img.onerror = () => resolve('');
-        img.src = `data:${file.type};base64,${base64Data}`;
+        img.src = `data:${mimeType};base64,${base64Data}`;
       });
+
+      if (!import.meta.env.VITE_OPENAI_API_KEY) {
+        throw new Error('Missing VITE_OPENAI_API_KEY. Add your Groq API key to the environment and restart the app.');
+      }
 
       const openai = new OpenAI({
         apiKey: import.meta.env.VITE_OPENAI_API_KEY,
@@ -606,6 +707,7 @@ Rules:
 - Estimate nutrition for a standard serving size
 - "confidence" should reflect how certain you are (50-99)
 - "grade" should be A/A+/B/B+/C/C+ based on nutritional quality`;
+      prompt = getFoodPrompt(false);
 
       // ── API call with 45-second timeout ──
       const controller = new AbortController();
@@ -614,14 +716,14 @@ Rules:
       let response;
       try {
         response = await openai.chat.completions.create({
-          model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+          model: FOOD_SCAN_MODEL,
           max_tokens: 700,
           temperature: 0.2,
           messages: [{
             role: 'user',
             content: [
               { type: 'text', text: prompt },
-              { type: 'image_url', image_url: { url: `data:${file.type};base64,${base64Data}`, detail: 'high' } },
+              { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64Data}`, detail: 'high' } },
             ],
           }],
         }, { signal: controller.signal });
@@ -633,55 +735,68 @@ Rules:
       let text = (response.choices[0].message.content || '').trim();
       console.log('Groq raw response:', text);
 
-      // Strip markdown fences if model wrapped output
-      text = text.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
-
-      // Extract outermost JSON object
-      const jsonStart = text.indexOf('{');
-      const jsonEnd   = text.lastIndexOf('}');
-      if (jsonStart === -1 || jsonEnd === -1) {
-        console.warn('No JSON found in response');
-        addAiLog({ status: 'error', error: 'AI returned no JSON. Raw: ' + text.slice(0, 200), rawText: text, prompt, durationMs, thumbnail: thumbnailData });
-        setPhase('error');
-        return;
-      }
-
       let parsedData;
       try {
-        parsedData = JSON.parse(text.slice(jsonStart, jsonEnd + 1));
+        parsedData = extractJsonObject(text);
       } catch (parseErr) {
         console.warn('JSON parse failed:', parseErr);
         addAiLog({ status: 'error', error: 'JSON parse error: ' + parseErr.message, rawText: text, prompt, durationMs, thumbnail: thumbnailData });
+        setErrorInfo({ kind: 'scan_failed', message: 'The AI returned an unreadable result. Please try the scan again.' });
         setPhase('error');
         return;
       }
 
-      // If model flagged not_food via the name field
-      if (parsedData.name === 'not_food' || parsedData.error === 'not_food') {
+      if (!parsedData) {
+        console.warn('No JSON found in response');
+        addAiLog({ status: 'error', error: 'AI returned no JSON. Raw: ' + text.slice(0, 200), rawText: text, prompt, durationMs, thumbnail: thumbnailData });
+        setErrorInfo({ kind: 'scan_failed', message: 'The AI returned an empty result. Please try the scan again.' });
+        setPhase('error');
+        return;
+      }
+
+      // A second pass prevents real meals from being rejected too quickly.
+      if (isNotFoodResult(parsedData)) {
+        const retryPrompt = getFoodPrompt(true);
+        prompt = retryPrompt;
+        const retryController = new AbortController();
+        const retryTimeoutId = setTimeout(() => retryController.abort(), 45000);
+
+        try {
+          const retryResponse = await openai.chat.completions.create({
+            model: FOOD_SCAN_MODEL,
+            max_tokens: 700,
+            temperature: 0.1,
+            messages: [{
+              role: 'user',
+              content: [
+                { type: 'text', text: retryPrompt },
+                { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64Data}`, detail: 'high' } },
+              ],
+            }],
+          }, { signal: retryController.signal });
+
+          const retryText = (retryResponse.choices[0].message.content || '').trim();
+          console.log('Groq retry response:', retryText);
+          text = `${text}\n\n--- retry ---\n${retryText}`;
+          const retryData = extractJsonObject(retryText);
+          if (retryData) parsedData = retryData;
+        } finally {
+          clearTimeout(retryTimeoutId);
+        }
+      }
+
+      if (isNotFoodResult(parsedData)) {
         addAiLog({ status: 'error', error: 'Image does not appear to contain food', rawText: text, parsedData, prompt, durationMs, thumbnail: thumbnailData });
+        setErrorInfo({ kind: 'not_food', message: '' });
         setPhase('error');
         return;
       }
 
-      // Ensure required fields have sensible defaults so Result screen never crashes
-      parsedData.name        = parsedData.name        || 'Detected Meal';
-      parsedData.calories    = parsedData.calories    || 0;
-      parsedData.protein     = parsedData.protein     || 0;
-      parsedData.carbs       = parsedData.carbs       || 0;
-      parsedData.fat         = parsedData.fat         || 0;
-      parsedData.fiber       = parsedData.fiber       || 0;
-      parsedData.sugar       = parsedData.sugar       || 0;
-      parsedData.sodium      = parsedData.sodium      || 0;
-      parsedData.cholesterol = parsedData.cholesterol || 0;
-      parsedData.grade       = parsedData.grade       || 'B';
-      parsedData.confidence  = parsedData.confidence  || 75;
-      parsedData.ingredients = parsedData.ingredients || [];
-      parsedData.vitamins    = parsedData.vitamins    || {};
-      parsedData.coach       = parsedData.coach       || 'Eat mindfully and enjoy your meal!';
+      parsedData = normalizeMealData(parsedData);
 
       addAiLog({
         status: 'success',
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        model: FOOD_SCAN_MODEL,
         rawText: text,
         parsedData,
         prompt,
@@ -702,6 +817,12 @@ Rules:
         : (err.message || String(err));
       console.error('Groq API error:', errorMsg);
       addAiLog({ status: 'error', error: errorMsg, durationMs, thumbnail: thumbnailData, prompt });
+      setErrorInfo({
+        kind: 'scan_failed',
+        message: isTimeout
+          ? 'The AI scanner took too long to respond. Please try again.'
+          : 'The AI scanner could not process this photo. Please try again.',
+      });
       setPhase('error');
     }
   }, [addAiLog]);
@@ -733,7 +854,7 @@ Rules:
         <ScanningScreen key="scanning" imageUrl={imageUrl} />
       )}
       {phase === 'error' && (
-        <ErrorScreen key="error" onRetry={handleRescan} onBack={onBack} />
+        <ErrorScreen key="error" onRetry={handleRescan} onBack={onBack} kind={errorInfo.kind} message={errorInfo.message} />
       )}
       {phase === 'result' && meal && (
         <ResultScreen
