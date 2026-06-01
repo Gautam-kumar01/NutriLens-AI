@@ -533,6 +533,11 @@ export default function AnalysisPage({ onBack }) {
       return;
     }
 
+    // ── startTime lives OUTSIDE try so catch can always read it ──
+    const startTime = performance.now();
+    let thumbnailData = '';
+    let prompt = '';
+
     try {
       // Convert file to base64
       const reader = new FileReader();
@@ -543,8 +548,8 @@ export default function AnalysisPage({ onBack }) {
       reader.readAsDataURL(file);
       const base64Data = await base64Promise;
 
-      // Create thumbnail for logs
-      const thumbPromise = new Promise((resolve) => {
+      // Create compressed thumbnail (max 400px, 70% quality) for logs
+      thumbnailData = await new Promise((resolve) => {
         const img = new Image();
         img.onload = () => {
           const canvas = document.createElement('canvas');
@@ -553,26 +558,18 @@ export default function AnalysisPage({ onBack }) {
           let width = img.width;
           let height = img.height;
           if (width > height) {
-            if (width > MAX_SIZE) {
-              height *= MAX_SIZE / width;
-              width = MAX_SIZE;
-            }
+            if (width > MAX_SIZE) { height = Math.round(height * MAX_SIZE / width); width = MAX_SIZE; }
           } else {
-            if (height > MAX_SIZE) {
-              width *= MAX_SIZE / height;
-              height = MAX_SIZE;
-            }
+            if (height > MAX_SIZE) { width = Math.round(width * MAX_SIZE / height); height = MAX_SIZE; }
           }
           canvas.width = width;
           canvas.height = height;
           ctx.drawImage(img, 0, 0, width, height);
           resolve(canvas.toDataURL('image/jpeg', 0.7));
         };
+        img.onerror = () => resolve('');
         img.src = `data:${file.type};base64,${base64Data}`;
       });
-      const thumbnailData = await thumbPromise;
-
-      const startTime = performance.now();
 
       const openai = new OpenAI({
         apiKey: import.meta.env.VITE_OPENAI_API_KEY,
@@ -580,7 +577,7 @@ export default function AnalysisPage({ onBack }) {
         dangerouslyAllowBrowser: true,
       });
 
-      const prompt = `You are a professional nutritionist AI. Carefully analyze this food image.
+      prompt = `You are a professional nutritionist AI. Carefully analyze this food image.
 If the image does NOT contain any food, return ONLY: {"error": "not_food"}
 If it contains food, return ONLY a JSON object (no markdown, no extra text) in this exact format:
 {
@@ -603,43 +600,46 @@ If it contains food, return ONLY a JSON object (no markdown, no extra text) in t
 }
 Base all nutrition values on a standard single serving. For Indian meals, be specific (e.g. 'Dal Tadka with Steamed Rice', not just 'Indian Food').`;
 
-      const response = await openai.chat.completions.create({
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-        max_tokens: 800,
-        temperature: 0.1,
-        messages: [
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: prompt },
-              {
-                type: 'image_url',
-                image_url: {
-                  url: `data:${file.type};base64,${base64Data}`,
-                  detail: 'high',
-                },
-              },
-            ],
-          },
-        ],
-      });
+      // 45-second abort controller so scanning never gets stuck forever
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 45000);
 
+      let response;
+      try {
+        response = await openai.chat.completions.create({
+          model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+          max_tokens: 600,
+          temperature: 0.1,
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: prompt },
+                {
+                  type: 'image_url',
+                  image_url: {
+                    url: `data:${file.type};base64,${base64Data}`,
+                    detail: 'auto',
+                  },
+                },
+              ],
+            },
+          ],
+        }, { signal: controller.signal });
+      } finally {
+        clearTimeout(timeoutId);
+      }
+
+      const durationMs = Math.round(performance.now() - startTime);
       let text = response.choices[0].message.content || '';
       console.log('Groq raw response:', text);
-      const durationMs = Math.round(performance.now() - startTime);
 
-      // Extract JSON block robustly
+      // ── Robust JSON extraction ── strip markdown fences if present
+      text = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
       const jsonMatch = text.match(/\{[\s\S]*\}/);
       if (!jsonMatch) {
-        console.warn('No JSON in response, showing error screen');
-        addAiLog({
-          status: 'error',
-          error: 'No JSON found in response',
-          rawText: text,
-          prompt,
-          durationMs,
-          thumbnail: thumbnailData
-        });
+        console.warn('No JSON in response');
+        addAiLog({ status: 'error', error: 'No JSON found in AI response', rawText: text, prompt, durationMs, thumbnail: thumbnailData });
         setPhase('error');
         return;
       }
@@ -648,29 +648,14 @@ Base all nutrition values on a standard single serving. For Indian meals, be spe
       try {
         parsedData = JSON.parse(jsonMatch[0]);
       } catch (parseErr) {
-        console.warn('JSON parse failed, showing error screen:', parseErr);
-        addAiLog({
-          status: 'error',
-          error: 'JSON parse failed: ' + parseErr.message,
-          rawText: text,
-          prompt,
-          durationMs,
-          thumbnail: thumbnailData
-        });
+        console.warn('JSON parse failed:', parseErr);
+        addAiLog({ status: 'error', error: 'JSON parse failed: ' + parseErr.message, rawText: text, prompt, durationMs, thumbnail: thumbnailData });
         setPhase('error');
         return;
       }
 
       if (parsedData.error === 'not_food') {
-        addAiLog({
-          status: 'error',
-          error: 'Not food detected',
-          rawText: text,
-          parsedData,
-          prompt,
-          durationMs,
-          thumbnail: thumbnailData
-        });
+        addAiLog({ status: 'error', error: 'No food detected in image', rawText: text, parsedData, prompt, durationMs, thumbnail: thumbnailData });
         setPhase('error');
         return;
       }
@@ -690,17 +675,17 @@ Base all nutrition values on a standard single serving. For Indian meals, be spe
       setPhase('result');
 
     } catch (err) {
-      const durationMs = Math.round(performance.now() - (startTime || performance.now()));
-      console.error('Groq/OpenAI API error:', err);
-      addAiLog({
-        status: 'error',
-        error: err.message || String(err),
-        durationMs
-      });
-      // API error (like missing key, rate limit, etc.) → show error screen
+      // startTime is declared before try so it's always readable here
+      const durationMs = Math.round(performance.now() - startTime);
+      const isTimeout = err.name === 'AbortError';
+      const errorMsg = isTimeout
+        ? 'Request timed out after 45 seconds'
+        : (err.message || String(err));
+      console.error('Groq API error:', errorMsg);
+      addAiLog({ status: 'error', error: errorMsg, durationMs, thumbnail: thumbnailData, prompt });
       setPhase('error');
     }
-  }, []);
+  }, [addAiLog]);
 
   const handleFile = (file) => {
     const url = URL.createObjectURL(file);
