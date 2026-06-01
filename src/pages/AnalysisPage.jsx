@@ -543,6 +543,37 @@ export default function AnalysisPage({ onBack }) {
       reader.readAsDataURL(file);
       const base64Data = await base64Promise;
 
+      // Create thumbnail for logs
+      const thumbPromise = new Promise((resolve) => {
+        const img = new Image();
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          const ctx = canvas.getContext('2d');
+          const MAX_SIZE = 400;
+          let width = img.width;
+          let height = img.height;
+          if (width > height) {
+            if (width > MAX_SIZE) {
+              height *= MAX_SIZE / width;
+              width = MAX_SIZE;
+            }
+          } else {
+            if (height > MAX_SIZE) {
+              width *= MAX_SIZE / height;
+              height = MAX_SIZE;
+            }
+          }
+          canvas.width = width;
+          canvas.height = height;
+          ctx.drawImage(img, 0, 0, width, height);
+          resolve(canvas.toDataURL('image/jpeg', 0.7));
+        };
+        img.src = `data:${file.type};base64,${base64Data}`;
+      });
+      const thumbnailData = await thumbPromise;
+
+      const startTime = performance.now();
+
       const openai = new OpenAI({
         apiKey: import.meta.env.VITE_OPENAI_API_KEY,
         baseURL: 'https://api.groq.com/openai/v1',
@@ -595,12 +626,7 @@ Base all nutrition values on a standard single serving. For Indian meals, be spe
 
       let text = response.choices[0].message.content || '';
       console.log('Groq raw response:', text);
-      
-      addAiLog({
-        status: 'success',
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-        rawText: text
-      });
+      const durationMs = Math.round(performance.now() - startTime);
 
       // Extract JSON block robustly
       const jsonMatch = text.match(/\{[\s\S]*\}/);
@@ -609,7 +635,10 @@ Base all nutrition values on a standard single serving. For Indian meals, be spe
         addAiLog({
           status: 'error',
           error: 'No JSON found in response',
-          rawText: text
+          rawText: text,
+          prompt,
+          durationMs,
+          thumbnail: thumbnailData
         });
         setPhase('error');
         return;
@@ -620,24 +649,53 @@ Base all nutrition values on a standard single serving. For Indian meals, be spe
         parsedData = JSON.parse(jsonMatch[0]);
       } catch (parseErr) {
         console.warn('JSON parse failed, showing error screen:', parseErr);
+        addAiLog({
+          status: 'error',
+          error: 'JSON parse failed: ' + parseErr.message,
+          rawText: text,
+          prompt,
+          durationMs,
+          thumbnail: thumbnailData
+        });
         setPhase('error');
         return;
       }
 
       if (parsedData.error === 'not_food') {
+        addAiLog({
+          status: 'error',
+          error: 'Not food detected',
+          rawText: text,
+          parsedData,
+          prompt,
+          durationMs,
+          thumbnail: thumbnailData
+        });
         setPhase('error');
         return;
       }
+
+      addAiLog({
+        status: 'success',
+        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        rawText: text,
+        parsedData,
+        prompt,
+        durationMs,
+        thumbnail: thumbnailData
+      });
 
       setMeal(parsedData);
       setScanTime(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
       setPhase('result');
 
     } catch (err) {
+      const durationMs = Math.round(performance.now() - (startTime || performance.now()));
       console.error('Groq/OpenAI API error:', err);
       addAiLog({
         status: 'error',
         error: err.message || String(err),
+        durationMs
       });
       // API error (like missing key, rate limit, etc.) → show error screen
       setPhase('error');
