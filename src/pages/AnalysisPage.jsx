@@ -511,7 +511,7 @@ function ErrorScreen({ onRetry, onBack }) {
 
 // ─── Main exported page ────────────────────────────────────────────
 export default function AnalysisPage({ onBack }) {
-  const { addMeal }   = useStore();
+  const { addMeal, addAiLog } = useStore();
   const [phase, setPhase]     = useState('picker');   // picker | scanning | result | error
   const [imageUrl, setImageUrl] = useState('');
   const [meal, setMeal]       = useState(null);
@@ -594,12 +594,23 @@ Base all nutrition values on a standard single serving. For Indian meals, be spe
       });
 
       let text = response.choices[0].message.content || '';
-      console.log('OpenAI raw response:', text);
+      console.log('Groq raw response:', text);
+      
+      addAiLog({
+        status: 'success',
+        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        rawText: text
+      });
 
       // Extract JSON block robustly
       const jsonMatch = text.match(/\{[\s\S]*\}/);
       if (!jsonMatch) {
         console.warn('No JSON in response, showing error screen');
+        addAiLog({
+          status: 'error',
+          error: 'No JSON found in response',
+          rawText: text
+        });
         setPhase('error');
         return;
       }
@@ -623,7 +634,11 @@ Base all nutrition values on a standard single serving. For Indian meals, be spe
       setPhase('result');
 
     } catch (err) {
-      console.error('OpenAI error:', err);
+      console.error('Groq/OpenAI API error:', err);
+      addAiLog({
+        status: 'error',
+        error: err.message || String(err),
+      });
       // API error (like missing key, rate limit, etc.) → show error screen
       setPhase('error');
     }

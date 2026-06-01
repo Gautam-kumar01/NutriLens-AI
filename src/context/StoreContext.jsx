@@ -28,6 +28,7 @@ const DEFAULT = {
   water: 0,
   streak: 3,
   history: [],
+  aiLogs: [],
   theme: 'light',
 };
 
@@ -72,8 +73,22 @@ export const StoreProvider = ({ children }) => {
 
   const setTheme = (theme) => setState(prev => ({ ...prev, theme }));
 
+  const addAiLog = (logData) => {
+    const entry = {
+      id: Date.now().toString(),
+      timestamp: new Date().toLocaleString(),
+      ...logData,
+    };
+    setState(prev => ({
+      ...prev,
+      aiLogs: [entry, ...(prev.aiLogs || [])].slice(0, 100),
+    }));
+  };
+
+  const clearAiLogs = () => setState(prev => ({ ...prev, aiLogs: [] }));
+
   return (
-    <StoreContext.Provider value={{ state, updateProfile, addMeal, addWater, setTheme }}>
+    <StoreContext.Provider value={{ state, updateProfile, addMeal, addWater, setTheme, addAiLog, clearAiLogs }}>
       {children}
     </StoreContext.Provider>
   );

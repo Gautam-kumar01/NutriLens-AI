@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Camera, History, BarChart2, Sun, Moon, User, Target } from 'lucide-react';
+import { Camera, History, BarChart2, Sun, Moon, User, Target, Terminal } from 'lucide-react';
 import { useStore } from './context/StoreContext';
 import HomePage from './pages/HomePage';
 import HistoryPage from './pages/HistoryPage';
@@ -7,6 +7,7 @@ import StatsPage from './pages/StatsPage';
 import AnalysisPage from './pages/AnalysisPage';
 import OnboardingPage from './pages/OnboardingPage';
 import GoalsPage from './pages/GoalsPage';
+import AiLogsPage from './pages/AiLogsPage';
 import './App.css';
 
 const NAV_ITEMS = [
@@ -14,6 +15,7 @@ const NAV_ITEMS = [
   { id: 'history', label: 'Diary',  Icon: History  },
   { id: 'stats',   label: 'Stats',  Icon: BarChart2 },
   { id: 'goals',   label: 'Goals',  Icon: Target   },
+  { id: 'ai-logs', label: 'Logs',   Icon: Terminal },
 ];
 
 function App() {
@@ -35,6 +37,7 @@ function App() {
     history: 'My Diary',
     stats:   'Analytics',
     goals:   'My Goals',
+    'ai-logs': 'AI Logs',
   };
 
   return (
@@ -74,6 +77,7 @@ function App() {
         {activeTab === 'history'  && <HistoryPage />}
         {activeTab === 'stats'    && <StatsPage />}
         {activeTab === 'goals'    && <GoalsPage />}
+        {activeTab === 'ai-logs'  && <AiLogsPage />}
         {activeTab === 'analysis' && <AnalysisPage onBack={() => setActiveTab('home')} />}
       </main>
 
